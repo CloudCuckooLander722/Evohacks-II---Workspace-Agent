@@ -186,6 +186,54 @@ def test_credentials_oauth_client_runs_consent_flow(tmp_path, monkeypatch, fresh
     assert called == [str(path)]
 
 
+WEB_CLIENT = {"web": {"client_id": "c", "client_secret": "s", "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                      "token_uri": "https://oauth2.googleapis.com/token", "redirect_uris": ["https://app.example/"]}}
+
+
+def test_credentials_stale_path_says_so(monkeypatch, fresh_credentials):
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", "/nowhere/credentials.json")
+    with pytest.raises(FileNotFoundError, match="GOOGLE_CREDENTIALS_PATH is /nowhere"):
+        t._credentials()
+
+
+def test_web_client_needs_sign_in_then_uses_token(tmp_path, monkeypatch, fresh_credentials):
+    path = write_json(tmp_path, "credentials.json", WEB_CLIENT)
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", str(path))
+    monkeypatch.delenv("GOOGLE_OAUTH_TOKEN_FILE", raising=False)
+    assert t.google_sign_in_status() == "signed_out"
+    with pytest.raises(t.GoogleSignInRequired):
+        t._credentials()
+
+    # The consent URL uses the client's registered redirect and remembers the PKCE verifier.
+    from urllib.parse import parse_qs, urlparse
+    query = parse_qs(urlparse(t.google_sign_in_url()).query)
+    assert query["redirect_uri"] == ["https://app.example/"]
+    state = query["state"][0]
+    assert state in t._PENDING_SIGN_INS
+
+    # Finishing the sign-in stores the token next to the client file.
+    from google_auth_oauthlib.flow import Flow
+    def fake_fetch(self, **kw):
+        assert kw == {"code": "abc"} and self.code_verifier
+        self.oauth2session.token = {"access_token": "a", "refresh_token": "r", "token_type": "Bearer",
+                                    "expires_in": 3600, "expires_at": 4102444800, "scope": t.SCOPES}
+    monkeypatch.setattr(Flow, "fetch_token", fake_fetch)
+    t.complete_google_sign_in("abc", state)
+    assert (tmp_path / "token.json").exists() and state not in t._PENDING_SIGN_INS
+    assert t.google_sign_in_status() == "signed_in"
+    assert t._credentials().refresh_token == "r"
+
+    with pytest.raises(ValueError, match="expired"):
+        t.complete_google_sign_in("abc", "unknown-state")
+
+
+def test_sign_in_not_needed_without_web_client(tmp_path, monkeypatch):
+    monkeypatch.delenv("GOOGLE_CREDENTIALS_PATH", raising=False)
+    assert t.google_sign_in_status() == "not_needed"
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", str(write_json(tmp_path, "c.json", {"installed": {"client_id": "c"}})))
+    assert t.google_sign_in_status() == "not_needed"
+
+
 def test_request_shapes_match_google_discovery_docs():
     """Build (without sending) every request the module makes; bad method/param names raise TypeError."""
     from google.auth.credentials import AnonymousCredentials
@@ -220,10 +268,19 @@ def test_list_files_paginates(drive):
 
 
 def test_list_drive_folders_success_and_error(monkeypatch):
-    monkeypatch.setattr(t, "_list_files", lambda q: [{"id": "1", "name": "A", "mimeType": t.FOLDER_MIME}])
-    assert t.list_drive_folders() == {"folders": [{"id": "1", "name": "A"}]}
+    seen = {}
 
-    def fail(q):
+    def list_files(q, fields=None):
+        seen["fields"] = fields
+        return [{"id": "1", "name": "A", "capabilities": {"canAddChildren": True}},
+                {"id": "2", "name": "Shared read-only", "capabilities": {"canAddChildren": False}},
+                {"id": "3", "name": "No capabilities returned"}]
+    monkeypatch.setattr(t, "_list_files", list_files)
+    # Only folders the user can add files to (read-only shared folders cause 403 on upload).
+    assert t.list_drive_folders() == {"folders": [{"id": "1", "name": "A"}]}
+    assert "capabilities/canAddChildren" in seen["fields"]
+
+    def fail(q, fields=None):
         raise ConnectionError("offline")
     monkeypatch.setattr(t, "_list_files", fail)
     assert t.list_drive_folders()["status"] == "error"
@@ -289,6 +346,41 @@ def test_read_drive_file_by_type(drive, monkeypatch, mime, expected):
     result = t.read_drive_file("1")
     assert result["content"] == expected
     assert result["truncated"] is False
+
+
+def _xlsx_bytes() -> bytes:
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.active.title = "Q3"
+    wb.active.append(["region", "revenue"])
+    wb.active.append(["north", 120])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _docx_bytes() -> bytes:
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml",
+                   '<w:document><w:body><w:p><w:r><w:t>Salmon &amp; trout</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:t xml:space="preserve">Year two </w:t></w:r><w:r><w:t>results</w:t></w:r></w:p>'
+                   '</w:body></w:document>')
+    return buf.getvalue()
+
+
+def test_extract_file_text():
+    assert t.extract_file_text(_xlsx_bytes(), t.XLSX_MIME) == "## Q3\nregion,revenue\nnorth,120"
+    assert t.extract_file_text(_docx_bytes(), t.DOCX_MIME) == "Salmon & trout\nYear two results"
+    assert t.extract_file_text(b"a,b", "text/csv") == "a,b"
+    assert t.extract_file_text(b"x", "application/zip") is None
+
+
+def test_read_drive_file_reads_uploaded_excel(drive, monkeypatch):
+    drive.files().get().execute.return_value = {"id": "1", "name": "q3.xlsx", "mimeType": t.XLSX_MIME}
+    monkeypatch.setattr(t, "_download", lambda req: _xlsx_bytes())
+    assert "north,120" in t.read_drive_file("1")["content"]
 
 
 def test_read_drive_file_truncates_and_rejects_unknown_types(drive, monkeypatch):
@@ -383,10 +475,26 @@ def test_workspace_category_schema():
     ok = wa.WorkspaceCategory(category="FOLDER_DELETION", confidence=0.9, request="delete X")
     assert ok.missing_info is None
     for bad in [{"category": "NOPE", "confidence": 0.9, "request": "x"},
-                {"category": "UNKNOWN", "confidence": 1.5, "request": "x"},
-                {"category": "UNKNOWN", "confidence": 0.5, "request": "x", "extra": 1}]:
+                {"category": "UNKNOWN", "confidence": 1.5, "request": "x"}]:
         with pytest.raises(Exception):
             wa.WorkspaceCategory(**bad)
+    # Unknown keys are ignored (extra='forbid' would put additionalProperties in the Gemini schema).
+    assert not hasattr(wa.WorkspaceCategory(category="UNKNOWN", confidence=0.5, request="x", extra=1), "extra")
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None), ("", None), ("None", None), ("N/A", None), (" nothing is missing. ", None),
+    ("which report to summarize", "which report to summarize"),
+])
+def test_missing_info_placeholders_become_none(value, expected):
+    decision = wa.WorkspaceCategory(category="UNKNOWN", confidence=0.5, request="x", missing_info=value)
+    assert decision.missing_info == expected
+
+
+def test_gemini_schemas_have_no_additional_properties():
+    from google.genai import _transformers
+    for model in (wa.WorkspaceCategory, wa.DocumentCommand, wa.FolderCommand, wa.MoveCommand, wa.Confirmation):
+        assert "additional_properties" not in json.dumps(_transformers.t_schema(None, model).model_dump(exclude_none=True, mode="json"))
 
 
 def test_document_command_schema():
@@ -429,6 +537,7 @@ def test_creators_cover_every_file_type():
     ({"category": "FOLDER_CREATION", "confidence": 0.9, "request": "r"}, "FOLDER_CREATION"),
     ({"category": "FOLDER_CREATION", "confidence": 0.5, "request": "r"}, "UNKNOWN"),
     ({"category": "DOCUMENT_CREATION", "confidence": 0.9, "request": "r", "missing_info": "no report"}, "UNKNOWN"),
+    ({"category": "DOCUMENT_CREATION", "confidence": 0.9, "request": "r", "missing_info": "None"}, "DOCUMENT_CREATION"),
 ])
 def test_route_request(decision, route):
     event = wa.route_request(decision)
@@ -439,6 +548,38 @@ def test_route_request(decision, route):
 def test_handle_unknown_mentions_missing_info():
     event = wa.handle_unknown(SimpleNamespace(state={"router_decision": {"missing_info": "which report"}}))
     assert "which report" in event.content.parts[0].text
+    event = wa.handle_unknown(SimpleNamespace(state={"router_decision": {"missing_info": "N/A"}}))
+    assert "N/A" not in event.content.parts[0].text
+
+
+def _request(*parts):
+    from google.adk.models import LlmRequest
+    from google.genai import types
+    return LlmRequest(contents=[types.Content(role="user", parts=list(parts))])
+
+
+def test_prepare_attachments_converts_and_labels_files():
+    from google.genai import types
+    xlsx = types.Part(inline_data=types.Blob(data=_xlsx_bytes(), mime_type=t.XLSX_MIME, display_name="q3.xlsx"))
+    pdf = types.Part(inline_data=types.Blob(data=b"%PDF", mime_type="application/pdf", display_name="r.pdf"))
+    req = _request(types.Part(text="Summarize this report"), xlsx, pdf)
+    original = req.contents[0]
+    wa.prepare_attachments(None, req)
+
+    parts = req.contents[0].parts
+    assert parts[0].text == "Summarize this report"
+    assert parts[1].text == f"[Attached file: q3.xlsx ({t.XLSX_MIME})]" and "north,120" in parts[2].text
+    assert parts[3].text.startswith("[Attached file: r.pdf")
+    assert parts[4].inline_data.data == b"%PDF" and parts[4].inline_data.display_name is None
+    # The session's own content keeps the original bytes and name.
+    assert original.parts[1].inline_data.display_name == "q3.xlsx"
+
+
+def test_prepare_attachments_unreadable_type_becomes_a_note():
+    from google.genai import types
+    req = _request(types.Part(inline_data=types.Blob(data=b"PK", mime_type="application/zip", display_name="a.zip")))
+    wa.prepare_attachments(None, req)
+    assert "can't be read" in req.contents[0].parts[0].text
 
 
 def test_create_document_uses_existing_folder_and_adds_answer_key(fake_drive):
@@ -466,27 +607,15 @@ def test_create_folder_skips_existing(fake_drive):
     assert fake_drive == [("mkdir", "AP Chem")]
 
 
-def test_move_document(fake_drive, monkeypatch):
-    wa.move_document({"file_query": "salmon.pdf", "folder_name": "Atlantic Salmon Research Project"})
-    assert fake_drive == [("mkdir", "Atlantic Salmon Research Project"),
-                          ("mv", "file1", "f-Atlantic Salmon Research Project")]
-
-    fake_drive.clear()
-    monkeypatch.setattr(wa, "search_drive_files", lambda q: {"files": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"}]})
-    assert "Several files match" in wa.move_document({"file_query": "x", "folder_name": "Y"}).content.parts[0].text
-    monkeypatch.setattr(wa, "search_drive_files", lambda q: {"files": []})
-    assert "No Drive file" in wa.move_document({"file_query": "x", "folder_name": "Y"}).content.parts[0].text
-    monkeypatch.setattr(wa, "search_drive_files", lambda q: {"status": "error", "error": "offline"})
-    assert wa.move_document({"file_query": "x", "folder_name": "Y"}).output["status"] == "error"
-    assert fake_drive == []
-
-
 # ===========================================================================
 # workspace_agent/workspace_agent.py — full workflow with a fake Gemini
 # ===========================================================================
 
-def run_workflow(reply=None):
-    """Run one request through root_agent; answer the confirmation prompt with `reply` if one appears."""
+def run_workflow(reply=None, attachments=()):
+    """Run one request through root_agent; answer the confirmation prompt with `reply` if one appears.
+
+    `attachments` are (name, bytes, mime) files sent with the request.
+    """
     from google.adk.runners import InMemoryRunner
     from google.genai import types
 
@@ -504,7 +633,8 @@ def run_workflow(reply=None):
                     if part.text and event.author != "user" and not part.text.lstrip().startswith("{"):
                         texts.append(part.text)
 
-        await send(types.Content(role="user", parts=[types.Part(text="request")]))
+        files = [types.Part(inline_data=types.Blob(data=d, mime_type=m, display_name=n)) for n, d, m in attachments]
+        await send(types.Content(role="user", parts=[types.Part(text="request"), *files]))
         asked = prompt
         if reply is not None and prompt:
             await send(types.Content(role="user", parts=[types.Part(function_response=types.FunctionResponse(
@@ -567,3 +697,39 @@ def test_workflow_unknown_or_low_confidence(fake_gemini, fake_drive, category, c
     texts, _ = run_workflow()
     assert fake_drive == []
     assert "I can create a Doc" in texts[-1]
+
+
+def test_workflow_move_uploads_attached_file(fake_gemini, fake_drive):
+    router(fake_gemini, "DOCUMENT_MOVEMENT")
+    texts, prompt = run_workflow(attachments=[("salmon.pdf", b"%PDF", "application/pdf")])
+    assert prompt is None
+    assert fake_drive == [("mkdir", "Atlantic Salmon Research Project"),
+                          ("upload", "salmon.pdf", "application/pdf", "f-Atlantic Salmon Research Project")]
+    assert "Uploaded 'salmon.pdf'" in texts[-1]
+
+
+def test_workflow_document_creation_with_attached_excel(fake_gemini, fake_drive):
+    router(fake_gemini, "DOCUMENT_CREATION")
+    texts, _ = run_workflow(reply={"approved": True}, attachments=[("q3.xlsx", _xlsx_bytes(), t.XLSX_MIME)])
+    assert ("create", "DOC", "Related Rates Quiz", "f-calc") in fake_drive
+
+
+@pytest.mark.parametrize("reply, moved", [({"approved": True}, True), ({"approved": False}, False)])
+def test_workflow_move_confirms_best_of_several_matches(fake_gemini, fake_drive, monkeypatch, reply, moved):
+    router(fake_gemini, "DOCUMENT_MOVEMENT")
+    monkeypatch.setattr(wa, "search_drive_files", lambda q: {"files": [
+        {"id": "old", "name": "salmon notes old.docx"}, {"id": "best", "name": "salmon.pdf.bak"}]})
+    texts, prompt = run_workflow(reply=reply)
+    assert prompt is not None and "salmon.pdf.bak" in json.dumps(prompt.args)
+    assert (("mv", "best", "f-Atlantic Salmon Research Project") in fake_drive) is moved
+    assert ("Moved 'salmon.pdf.bak'" if moved else "Cancelled") in texts[-1]
+
+
+@pytest.mark.parametrize("found, text", [({"files": []}, "No Drive file"), ({"status": "error", "error": "offline"}, None)])
+def test_workflow_move_no_match_or_error(fake_gemini, fake_drive, monkeypatch, found, text):
+    router(fake_gemini, "DOCUMENT_MOVEMENT")
+    monkeypatch.setattr(wa, "search_drive_files", lambda q: found)
+    texts, prompt = run_workflow()
+    assert prompt is None and fake_drive == []
+    if text:
+        assert text in texts[-1]

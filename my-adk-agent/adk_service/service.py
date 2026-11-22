@@ -17,7 +17,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -31,6 +31,14 @@ from workspace_agent import root_agent  # noqa: E402
 
 APP_NAME = "workspace_agent"
 REQUEST_INPUT_CALL = "adk_request_input"
+
+
+@dataclass
+class Attachment:
+    """A file the user attached to a message, sent to the agent as inline bytes."""
+    name: str
+    data: bytes
+    mime_type: str
 
 
 @dataclass
@@ -109,8 +117,13 @@ class WorkspaceService:
         events = [e async for e in self.runner.run_async(user_id=user_id, session_id=session_id, new_message=message)]
         return collect_reply(events, self.root_name)
 
-    async def asend(self, user_id: str, session_id: str, text: str) -> AgentReply:
-        return await self._arun(user_id, session_id, types.Content(role="user", parts=[types.Part(text=text)]))
+    async def asend(self, user_id: str, session_id: str, text: str,
+                    attachments: Sequence[Attachment] = ()) -> AgentReply:
+        parts = [types.Part(text=text)] + [
+            types.Part(inline_data=types.Blob(data=a.data, mime_type=a.mime_type, display_name=a.name))
+            for a in attachments
+        ]
+        return await self._arun(user_id, session_id, types.Content(role="user", parts=parts))
 
     async def arespond(self, user_id: str, session_id: str, pending: PendingConfirmation,
                        approved: bool, feedback: Optional[str] = None) -> AgentReply:
@@ -127,8 +140,9 @@ class WorkspaceService:
     def new_session(self, user_id: str) -> str:
         return self._call(self.anew_session(user_id))
 
-    def send(self, user_id: str, session_id: str, text: str) -> AgentReply:
-        return self._call(self.asend(user_id, session_id, text))
+    def send(self, user_id: str, session_id: str, text: str,
+             attachments: Sequence[Attachment] = ()) -> AgentReply:
+        return self._call(self.asend(user_id, session_id, text, attachments))
 
     def respond(self, user_id: str, session_id: str, pending: PendingConfirmation,
                 approved: bool, feedback: Optional[str] = None) -> AgentReply:

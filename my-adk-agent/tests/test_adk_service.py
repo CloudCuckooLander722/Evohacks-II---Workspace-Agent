@@ -14,7 +14,7 @@ from google.genai import types
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adk_service.service import (  # noqa: E402
-    APP_NAME, AgentReply, PendingConfirmation, WorkspaceService, collect_reply,
+    APP_NAME, AgentReply, Attachment, PendingConfirmation, WorkspaceService, collect_reply,
 )
 from conftest import set_router  # noqa: E402
 
@@ -135,6 +135,14 @@ def test_service_surfaces_tool_errors(service, fake_gemini, fake_drive, monkeypa
     set_router(fake_gemini, "DOCUMENT_MOVEMENT")
     reply = service.send("u1", service.new_session("u1"), "move it")
     assert reply.errors == ["search_drive_files: ConnectionError: offline"]
+
+
+def test_service_sends_attachments(service, fake_gemini, fake_drive):
+    set_router(fake_gemini, "DOCUMENT_MOVEMENT")
+    reply = service.send("u1", service.new_session("u1"), "Move this PDF to Atlantic Salmon Research Project",
+                         [Attachment(name="salmon.pdf", data=b"%PDF", mime_type="application/pdf")])
+    assert ("upload", "salmon.pdf", "application/pdf", "f-Atlantic Salmon Research Project") in fake_drive
+    assert reply.messages[-1].startswith("Uploaded 'salmon.pdf'")
 
 
 def test_service_sessions_are_independent(service, fake_gemini, fake_drive):

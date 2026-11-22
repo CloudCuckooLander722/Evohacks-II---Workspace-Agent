@@ -53,6 +53,8 @@ def fake_drive(monkeypatch):
     monkeypatch.setattr(wa, "search_drive_files",
                         lambda q: {"files": [{"id": "file1", "name": q}]})
     monkeypatch.setattr(wa, "move_drive_file", lambda fid, folder: log.append(("mv", fid, folder)))
+    monkeypatch.setattr(wa, "upload_drive_file",
+                        lambda name, data, mime, folder: log.append(("upload", name, mime, folder)) or {"id": "up"})
     for kind in list(wa.CREATORS):
         monkeypatch.setitem(wa.CREATORS, kind,
                             lambda title, content, fid, kind=kind: log.append(("create", kind, title, fid)) or {"id": "doc"})

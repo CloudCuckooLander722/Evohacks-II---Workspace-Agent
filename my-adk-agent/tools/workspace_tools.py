@@ -17,6 +17,7 @@ import json
 import os
 import re
 import uuid
+import zipfile
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +37,8 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 DOC_MIME = "application/vnd.google-apps.document"
 SLIDES_MIME = "application/vnd.google-apps.presentation"
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 FOLDER_MATCH_THRESHOLD = 0.75
 """Minimum rank_folders score for find_drive_folder to treat a folder as a match."""
@@ -60,25 +63,123 @@ def credentials_kind(path: str | os.PathLike) -> str:
     raise ValueError(f"{path} is not a service-account key, OAuth client, or authorized-user token.")
 
 
+class GoogleSignInRequired(RuntimeError):
+    """The OAuth client is a web client and nobody has signed in through the app yet."""
+
+
+def _client_type(client_file: str | os.PathLike) -> str:
+    """'web' or 'installed' for an OAuth client JSON."""
+    return "web" if "web" in json.loads(Path(client_file).read_text()) else "installed"
+
+
+def _token_path(client_file: str | os.PathLike) -> Path:
+    """Where the signed-in user's token is cached: GOOGLE_OAUTH_TOKEN_FILE, else next to the client JSON."""
+    override = os.environ.get("GOOGLE_OAUTH_TOKEN_FILE")
+    return Path(override) if override else Path(client_file).resolve().parent / "token.json"
+
+
 def _oauth_user_credentials(client_file: str):
-    """Run (once) the OAuth consent flow for an OAuth client JSON and cache the user token."""
+    """The signed-in user's credentials for an OAuth client JSON.
+
+    Uses (and refreshes) the cached token. Without one, an "installed" (Desktop) client runs the
+    local consent flow; a "web" client raises GoogleSignInRequired, because its sign-in has to go
+    through the app's registered redirect URI (see google_sign_in_url).
+    """
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
 
-    token_path = Path(os.environ.get("GOOGLE_OAUTH_TOKEN_FILE", "token.json"))
+    token_path = _token_path(client_file)
     creds = None
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if creds and creds.valid:
         return creds
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
-        creds = flow.run_local_server(port=int(os.environ.get("GOOGLE_OAUTH_PORT", "8080")), open_browser=False)
+        try:
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+            return creds
+        except RefreshError:
+            token_path.unlink(missing_ok=True)   # revoked or expired for good: sign in again
+
+    if _client_type(client_file) == "web":
+        raise GoogleSignInRequired("Not signed in to Google. Use 'Sign in with Google' in the app's sidebar first.")
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(client_file, SCOPES)
+    creds = flow.run_local_server(port=int(os.environ.get("GOOGLE_OAUTH_PORT", "8080")), open_browser=False)
     token_path.write_text(creds.to_json())
     return creds
+
+
+def _credentials_path() -> Optional[str]:
+    """GOOGLE_CREDENTIALS_PATH, checked to exist so a stale path fails with a clear message."""
+    path = os.environ.get("GOOGLE_CREDENTIALS_PATH")
+    if path and not Path(path).is_file():
+        raise FileNotFoundError(
+            f"GOOGLE_CREDENTIALS_PATH is {path}, but that file doesn't exist. "
+            "Fix it in workspace_agent/.env and restart the app."
+        )
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Web sign-in (OAuth "web" client; the app's URL is the registered redirect URI)
+# ---------------------------------------------------------------------------
+
+_PENDING_SIGN_INS: dict[str, Optional[str]] = {}
+"""OAuth state -> PKCE code verifier for sign-ins started but not finished. Process-wide, because
+Google's redirect opens a new browser session."""
+
+
+def _web_client_path() -> Optional[str]:
+    path = _credentials_path()
+    if path and credentials_kind(path) == "oauth_client" and _client_type(path) == "web":
+        return path
+    return None
+
+
+def _web_flow(client_file: str, **kwargs):
+    from google_auth_oauthlib.flow import Flow
+    redirect = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI") or \
+        json.loads(Path(client_file).read_text())["web"]["redirect_uris"][0]
+    return Flow.from_client_secrets_file(client_file, SCOPES, redirect_uri=redirect, **kwargs)
+
+
+def google_sign_in_status() -> str:
+    """'not_needed' (no web OAuth client configured), 'signed_in', or 'signed_out'."""
+    path = _web_client_path()
+    if not path:
+        return "not_needed"
+    return "signed_in" if _token_path(path).exists() else "signed_out"
+
+
+def google_sign_in_url() -> str:
+    """Start a sign-in: the Google consent URL, which redirects back to the app with ?code=&state=."""
+    path = _web_client_path()
+    if not path:
+        raise RuntimeError("GOOGLE_CREDENTIALS_PATH is not a web OAuth client.")
+    flow = _web_flow(path)
+    url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    while len(_PENDING_SIGN_INS) >= 20:
+        _PENDING_SIGN_INS.pop(next(iter(_PENDING_SIGN_INS)))
+    _PENDING_SIGN_INS[state] = flow.code_verifier
+    return url
+
+
+def complete_google_sign_in(code: str, state: str) -> None:
+    """Finish a sign-in from the redirect's query parameters and cache the user's token."""
+    path = _web_client_path()
+    if not path:
+        raise RuntimeError("GOOGLE_CREDENTIALS_PATH is not a web OAuth client.")
+    if state not in _PENDING_SIGN_INS:
+        raise ValueError("This sign-in link has expired or didn't come from this app. Please sign in again.")
+    flow = _web_flow(path, state=state, code_verifier=_PENDING_SIGN_INS.pop(state))
+    # Google may report the granted scopes in a different form; don't treat that as an error.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+    flow.fetch_token(code=code)
+    _token_path(path).write_text(flow.credentials.to_json())
+    _credentials.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -89,10 +190,11 @@ def _credentials():
     - a service-account key        -> used directly (sees only files shared with that account)
     - an authorized-user token     -> a user's refreshable login, e.g. token.json from a previous
                                       OAuth run; the way to reach a user's Drive on Cloud Run
-    - an OAuth client ("Desktop")  -> runs the consent flow once, caching the token
+    - an OAuth client              -> the signed-in user's cached token; a Desktop client runs the
+                                      consent flow once, a web client needs the app's sign-in
     Without it, Application Default Credentials are used (on Cloud Run: the service's account).
     """
-    path = os.environ.get("GOOGLE_CREDENTIALS_PATH")
+    path = _credentials_path()
     if path:
         kind = credentials_kind(path)
         if kind == "service_account":
@@ -130,12 +232,12 @@ def _q(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _list_files(q: str, limit: Optional[int] = None) -> list[dict]:
+def _list_files(q: str, limit: Optional[int] = None, fields: str = FILE_FIELDS) -> list[dict]:
     files, page_token = [], None
     while True:
         resp = _drive().files().list(
             q=q,
-            fields=f"nextPageToken, files({FILE_FIELDS})",
+            fields=f"nextPageToken, files({fields})",
             pageSize=min(limit or 1000, 1000),
             pageToken=page_token,
             supportsAllDrives=True,
@@ -370,14 +472,23 @@ def _create_infographic(title: str, content: str, folder_id: Optional[str] = Non
 # ---------------------------------------------------------------------------
 
 def _list_folders() -> list[dict]:
+    """Folders the user can add files to.
+
+    Folders shared with the user as viewer or commenter are left out: uploading or moving a file
+    into one fails with 403 insufficientParentPermissions. A subject name that only matches such
+    a folder then gets a new folder of the user's own.
+    """
+    folders = _list_files(f"mimeType='{FOLDER_MIME}' and trashed=false",
+                          fields="id, name, capabilities/canAddChildren")
     return [
         {"id": f["id"], "name": f["name"]}
-        for f in _list_files(f"mimeType='{FOLDER_MIME}' and trashed=false")
+        for f in folders
+        if f.get("capabilities", {}).get("canAddChildren")
     ]
 
 
 def list_drive_folders() -> dict:
-    """List all Google Drive folders the user has.
+    """List the Google Drive folders the user can add files to.
 
     Returns:
         {"folders": [{"id": str, "name": str}, ...]}
@@ -428,7 +539,7 @@ def rank_folders(topic: str, folders: list[dict]) -> list[dict]:
 
 
 def find_drive_folder(topic: str) -> dict:
-    """Find the existing Drive folder that best matches a topic via similarity search.
+    """Find the existing Drive folder (one the user can add files to) that best matches a topic via similarity search.
 
     Returns {"id", "name", "score"} for the best match, or {"id": None, "candidates": [...]}
     when no folder scores at least FOLDER_MATCH_THRESHOLD.
@@ -484,8 +595,53 @@ def _extract_pdf_text(data: bytes) -> str:
     return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def _extract_xlsx_text(data: bytes) -> str:
+    """Every sheet as CSV-like rows, each under a '## <sheet name>' heading."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    out = []
+    for sheet in wb.worksheets:
+        rows = [",".join("" if v is None else str(v) for v in row)
+                for row in sheet.iter_rows(values_only=True) if any(v is not None for v in row)]
+        out.append(f"## {sheet.title}\n" + "\n".join(rows))
+    wb.close()
+    return "\n\n".join(out)
+
+
+def _extract_docx_text(data: bytes) -> str:
+    """Paragraph text from a .docx (stdlib only: the body is word/document.xml)."""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        xml = z.read("word/document.xml").decode("utf-8", "replace")
+    paragraphs = re.findall(r"<w:p[ >].*?</w:p>", xml, flags=re.S)
+    texts = ("".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", p)) for p in paragraphs)
+    from html import unescape
+    return "\n".join(unescape(t) for t in texts if t.strip())
+
+
+def is_text_mime(mime: str) -> bool:
+    return mime.startswith("text/") or mime in ("application/json", "application/xml")
+
+
+def extract_file_text(data: bytes, mime: str) -> Optional[str]:
+    """Text content of a PDF, Excel, Word or plain-text file's bytes; None for unsupported types."""
+    if mime == "application/pdf":
+        return _extract_pdf_text(data)
+    if mime == XLSX_MIME:
+        return _extract_xlsx_text(data)
+    if mime == DOCX_MIME:
+        return _extract_docx_text(data)
+    if is_text_mime(mime):
+        return data.decode("utf-8", "replace")
+    return None
+
+
+def upload_drive_file(name: str, data: bytes, mime: str, folder_id: str) -> dict:
+    """Upload a file (e.g. one the user attached) into a Drive folder, keeping its format."""
+    return _upload(name, data, mime, folder_id)
+
+
 def read_drive_file(file_id: str) -> dict:
-    """Read the text content of a Google Drive file (Docs, Slides, Sheets, PDFs, and plain-text files).
+    """Read the text content of a Google Drive file (Docs, Slides, Sheets, PDFs, Excel, Word, and plain-text files).
 
     Args:
         file_id: The Drive file id, e.g. from search_drive_files.
@@ -501,10 +657,8 @@ def read_drive_file(file_id: str) -> dict:
             text = _download(drive.files().export_media(fileId=file_id, mimeType="text/plain")).decode("utf-8", "replace")
         elif mime == SHEET_MIME:
             text = _download(drive.files().export_media(fileId=file_id, mimeType="text/csv")).decode("utf-8", "replace")
-        elif mime == "application/pdf":
-            text = _extract_pdf_text(_download(drive.files().get_media(fileId=file_id, supportsAllDrives=True)))
-        elif mime.startswith("text/") or mime in ("application/json", "application/xml"):
-            text = _download(drive.files().get_media(fileId=file_id, supportsAllDrives=True)).decode("utf-8", "replace")
+        elif mime in ("application/pdf", XLSX_MIME, DOCX_MIME) or is_text_mime(mime):
+            text = extract_file_text(_download(drive.files().get_media(fileId=file_id, supportsAllDrives=True)), mime)
         else:
             return report_tool_error("read_drive_file", ValueError(f"Can't read files of type {mime}."))
         return {

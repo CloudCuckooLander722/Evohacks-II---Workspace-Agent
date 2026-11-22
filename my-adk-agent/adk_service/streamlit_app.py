@@ -23,7 +23,19 @@ from dotenv import load_dotenv  # noqa: E402
 if os.environ.get("WORKSPACE_AGENT_LOAD_DOTENV", "1") == "1":
     load_dotenv(PROJECT_ROOT / "workspace_agent" / ".env", override=False)
 
-from adk_service.service import AgentReply, WorkspaceService  # noqa: E402
+import mimetypes  # noqa: E402
+
+from adk_service.service import AgentReply, Attachment, WorkspaceService  # noqa: E402
+from tools.workspace_tools import (  # noqa: E402
+    complete_google_sign_in,
+    google_sign_in_status,
+    google_sign_in_url,
+)
+
+UPLOAD_TYPES = ["pdf", "xlsx", "docx", "csv", "txt", "md", "json", "png", "jpg", "jpeg"]
+# Attachments travel inline in the Gemini request, which is capped at about 20 MB in total.
+# (A comment, not a docstring: Streamlit "magic" renders bare string literals on the page.)
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
 EXAMPLES = [
     "I want a quiz on curveball related rates problems that test my concepts",
@@ -44,6 +56,7 @@ def init_state(service: WorkspaceService) -> None:
         st.session_state.session_id = service.new_session(st.session_state.user_id)
         st.session_state.history = []   # list of (role, text)
         st.session_state.pending = None
+        st.session_state.uploader_key = 0
 
 
 def record(reply: AgentReply) -> None:
@@ -56,10 +69,20 @@ def record(reply: AgentReply) -> None:
         st.session_state.history.append(("assistant", "Done."))
 
 
-def send(service: WorkspaceService, text: str) -> None:
-    st.session_state.history.append(("user", text))
+def to_attachments(files) -> list[Attachment]:
+    return [Attachment(name=f.name, data=f.getvalue(),
+                       mime_type=f.type or mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+            for f in files or []]
+
+
+def send(service: WorkspaceService, text: str, attachments: list[Attachment] = ()) -> None:
+    shown = text + "".join(f"\n\n📎 {a.name}" for a in attachments)
+    st.session_state.history.append(("user", shown))
+    if sum(len(a.data) for a in attachments) > MAX_UPLOAD_BYTES:
+        st.session_state.history.append(("assistant", "⚠️ Attachments are too large; keep them under 15 MB in total."))
+        return
     with st.spinner("Working on it…"):
-        record(service.send(st.session_state.user_id, st.session_state.session_id, text))
+        record(service.send(st.session_state.user_id, st.session_state.session_id, text, attachments))
 
 
 def answer(service: WorkspaceService, approved: bool, feedback: str) -> None:
@@ -69,21 +92,57 @@ def answer(service: WorkspaceService, approved: bool, feedback: str) -> None:
         record(service.respond(st.session_state.user_id, st.session_state.session_id, pending, approved, feedback))
 
 
+def handle_google_redirect() -> None:
+    """Google's consent screen redirects back here with ?code=&state= (or ?error=)."""
+    params = st.query_params
+    if "code" in params and "state" in params:
+        try:
+            complete_google_sign_in(params["code"], params["state"])
+            st.success("Signed in to Google. You can use the agent now.")
+        except Exception as e:
+            st.error(f"Google sign-in failed: {e}")
+        st.query_params.clear()
+    elif "error" in params:
+        st.error(f"Google sign-in was cancelled or failed: {params['error']}")
+        st.query_params.clear()
+
+
+def google_account_panel() -> None:
+    try:
+        status = google_sign_in_status()
+    except Exception as e:
+        st.error(f"Google credentials problem: {e}")
+        return
+    if status == "signed_out":
+        st.warning("Sign in so the agent can use your Google Drive.")
+        if "sign_in_url" not in st.session_state:
+            st.session_state.sign_in_url = google_sign_in_url()
+        st.link_button("Sign in with Google", st.session_state.sign_in_url, type="primary", width="stretch")
+    elif status == "signed_in":
+        st.caption("✅ Signed in to Google")
+
+
 def main() -> None:
     st.set_page_config(page_title="Workspace Agent", page_icon="📁")
     st.title("Workspace Agent")
     st.caption("Create Docs, Slides, PDFs and infographics, and organize your Google Drive folders.")
 
+    handle_google_redirect()
     service = get_service()
     init_state(service)
 
     with st.sidebar:
+        google_account_panel()
         st.subheader("Try")
         for example in EXAMPLES:
             if st.button(example, width="stretch", disabled=st.session_state.pending is not None):
                 send(service, example)
+        st.subheader("Attach")
+        files = st.file_uploader("Files to send with your next message (e.g. a report to summarize)",
+                                 type=UPLOAD_TYPES, accept_multiple_files=True,
+                                 key=f"uploader-{st.session_state.uploader_key}")
         if st.button("New conversation", type="secondary"):
-            for key in ("user_id", "session_id", "history", "pending"):
+            for key in ("user_id", "session_id", "history", "pending", "uploader_key"):
                 st.session_state.pop(key, None)
             st.rerun()
 
@@ -106,7 +165,8 @@ def main() -> None:
 
     prompt = st.chat_input("Ask the Workspace Agent…", disabled=pending is not None)
     if prompt:
-        send(service, prompt)
+        send(service, prompt, to_attachments(files))
+        st.session_state.uploader_key += 1   # clear the picker; the files went with this message
         st.rerun()
 
 
