@@ -1,0 +1,10 @@
+**/.env
+**/.env.*
+**/token.json
+**/client_secret*.json
+**/credentials*.json
+**/*service-account*.json
+**/__pycache__
+**/*.pyc
+tests/
+.pytest_cache/

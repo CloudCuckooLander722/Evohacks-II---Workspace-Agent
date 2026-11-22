@@ -1,0 +1,5 @@
+# Installed AFTER requirements.txt, then watchdog is pinned back to 7.x (see Dockerfile).
+# Every streamlit release declares watchdog<7 while google-adk requires watchdog>=7; streamlit only
+# uses watchdog for reloading on file changes, which is disabled in production
+# (server.fileWatcherType=none), so ADK's watchdog 7 wins.
+streamlit==1.50.0
