@@ -1,0 +1,19 @@
+# Files gcloud must NOT upload with `gcloud run deploy --source .` (the upload goes to a Cloud
+# Storage bucket for Cloud Build; .dockerignore only filters the image, not this upload).
+.gcloudignore
+.git
+.gitignore
+
+# Secrets: Gemini key, OAuth client, cached Google tokens, service-account keys
+**/.env
+**/.env.*
+**/token.json
+**/client_secret*.json
+**/credentials*.json
+**/*service-account*.json
+
+# Not needed to build or run
+**/__pycache__
+**/*.pyc
+.pytest_cache/
+tests/
