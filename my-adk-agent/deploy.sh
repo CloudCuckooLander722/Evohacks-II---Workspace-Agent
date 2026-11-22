@@ -16,6 +16,9 @@
 #   OAUTH_REDIRECT_URI=https://...   Web OAuth client only: the URL people open the app at,
 #       which must also be an authorized redirect URI on the client in Google Cloud Console.
 #       With a private service that is the `gcloud run services proxy` URL, not the run.app URL.
+#   PER_USER_SIGN_IN=1              With a web OAuth client: every visitor signs in and works on
+#                                   their own Drive; nothing falls back to a shared account.
+#                                   This is what makes ALLOW_PUBLIC=1 safe to use.
 #   ALLOW_PUBLIC=1                  Make the URL public. Default: callers need IAM
 #                                   (roles/run.invoker), because anyone who can open the
 #                                   app can create, move and trash files in the linked Drive.
@@ -63,6 +66,9 @@ if [[ -n "${DRIVE_CREDENTIALS_FILE:-}" ]]; then
   SECRETS="${SECRETS},/secrets/google/credentials.json=${SERVICE}-drive-credentials:latest"
   # Secret mounts are read-only; a signed-in user's token goes to the instance's /tmp.
   ENV_VARS="${ENV_VARS},GOOGLE_CREDENTIALS_PATH=/secrets/google/credentials.json,GOOGLE_OAUTH_TOKEN_FILE=/tmp/token.json"
+fi
+if [[ "${PER_USER_SIGN_IN:-0}" == "1" ]]; then
+  ENV_VARS="${ENV_VARS},GOOGLE_PER_USER_SIGN_IN=1"
 fi
 if [[ -n "${OAUTH_REDIRECT_URI:-}" ]]; then
   ENV_VARS="${ENV_VARS},GOOGLE_OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI}"

@@ -28,8 +28,10 @@ import mimetypes  # noqa: E402
 from adk_service.service import AgentReply, Attachment, WorkspaceService  # noqa: E402
 from tools.workspace_tools import (  # noqa: E402
     complete_google_sign_in,
+    exchange_google_sign_in,
     google_sign_in_status,
     google_sign_in_url,
+    per_user_sign_in,
 )
 
 UPLOAD_TYPES = ["pdf", "xlsx", "docx", "csv", "txt", "md", "json", "png", "jpg", "jpeg"]
@@ -82,14 +84,16 @@ def send(service: WorkspaceService, text: str, attachments: list[Attachment] = (
         st.session_state.history.append(("assistant", "⚠️ Attachments are too large; keep them under 15 MB in total."))
         return
     with st.spinner("Working on it…"):
-        record(service.send(st.session_state.user_id, st.session_state.session_id, text, attachments))
+        record(service.send(st.session_state.user_id, st.session_state.session_id, text, attachments,
+                            credentials=st.session_state.get("google_credentials")))
 
 
 def answer(service: WorkspaceService, approved: bool, feedback: str) -> None:
     pending = st.session_state.pending
     st.session_state.history.append(("user", ("Approved" if approved else "Cancelled") + (f": {feedback}" if feedback else "")))
     with st.spinner("Working on it…"):
-        record(service.respond(st.session_state.user_id, st.session_state.session_id, pending, approved, feedback))
+        record(service.respond(st.session_state.user_id, st.session_state.session_id, pending, approved, feedback,
+                               credentials=st.session_state.get("google_credentials")))
 
 
 def handle_google_redirect() -> None:
@@ -97,11 +101,16 @@ def handle_google_redirect() -> None:
     params = st.query_params
     if "code" in params and "state" in params:
         try:
-            complete_google_sign_in(params["code"], params["state"])
+            if per_user_sign_in():
+                # Public mode: this browser session's own account, kept in memory only.
+                st.session_state.google_credentials = exchange_google_sign_in(params["code"], params["state"])
+            else:
+                complete_google_sign_in(params["code"], params["state"])
             st.success("Signed in to Google. You can use the agent now.")
         except Exception as e:
             st.error(f"Google sign-in failed: {e}")
         st.query_params.clear()
+        st.session_state.pop("sign_in_url", None)   # its state is used up; make a fresh one if needed
     elif "error" in params:
         st.error(f"Google sign-in was cancelled or failed: {params['error']}")
         st.query_params.clear()
@@ -109,7 +118,10 @@ def handle_google_redirect() -> None:
 
 def google_account_panel() -> None:
     try:
-        status = google_sign_in_status()
+        if per_user_sign_in():
+            status = "signed_in" if st.session_state.get("google_credentials") else "signed_out"
+        else:
+            status = google_sign_in_status()
     except Exception as e:
         st.error(f"Google credentials problem: {e}")
         return
@@ -120,6 +132,10 @@ def google_account_panel() -> None:
         st.link_button("Sign in with Google", st.session_state.sign_in_url, type="primary", width="stretch")
     elif status == "signed_in":
         st.caption("✅ Signed in to Google")
+        if per_user_sign_in() and st.button("Sign out", width="stretch"):
+            for key in ("google_credentials", "sign_in_url"):
+                st.session_state.pop(key, None)
+            st.rerun()
 
 
 def main() -> None:
@@ -135,7 +151,8 @@ def main() -> None:
         google_account_panel()
         st.subheader("Try")
         for example in EXAMPLES:
-            if st.button(example, width="stretch", disabled=st.session_state.pending is not None):
+            if st.button(example, width="stretch", disabled=st.session_state.pending is not None
+                         or (per_user_sign_in() and not st.session_state.get("google_credentials"))):
                 send(service, example)
         st.subheader("Attach")
         files = st.file_uploader("Files to send with your next message (e.g. a report to summarize)",
@@ -163,7 +180,9 @@ def main() -> None:
                 answer(service, False, feedback)
                 st.rerun()
 
-    prompt = st.chat_input("Ask the Workspace Agent…", disabled=pending is not None)
+    needs_sign_in = per_user_sign_in() and not st.session_state.get("google_credentials")
+    prompt = st.chat_input("Sign in with Google (sidebar) to start" if needs_sign_in else "Ask the Workspace Agent…",
+                           disabled=pending is not None or needs_sign_in)
     if prompt:
         send(service, prompt, to_attachments(files))
         st.session_state.uploader_key += 1   # clear the picker; the files went with this message

@@ -17,6 +17,8 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 import zipfile
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -167,8 +169,8 @@ def google_sign_in_url() -> str:
     return url
 
 
-def complete_google_sign_in(code: str, state: str) -> None:
-    """Finish a sign-in from the redirect's query parameters and cache the user's token."""
+def exchange_google_sign_in(code: str, state: str):
+    """Finish a sign-in from the redirect's query parameters and return the user's credentials (not saved)."""
     path = _web_client_path()
     if not path:
         raise RuntimeError("GOOGLE_CREDENTIALS_PATH is not a web OAuth client.")
@@ -178,8 +180,48 @@ def complete_google_sign_in(code: str, state: str) -> None:
     # Google may report the granted scopes in a different form; don't treat that as an error.
     os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
     flow.fetch_token(code=code)
-    _token_path(path).write_text(flow.credentials.to_json())
+    return flow.credentials
+
+
+def complete_google_sign_in(code: str, state: str) -> None:
+    """Finish a sign-in from the redirect's query parameters and cache the user's token."""
+    creds = exchange_google_sign_in(code, state)
+    _token_path(_web_client_path()).write_text(creds.to_json())
     _credentials.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-user credentials (public deployment: every visitor works on their own Drive)
+# ---------------------------------------------------------------------------
+
+_user_credentials: ContextVar = ContextVar("google_user_credentials", default=None)
+
+
+def per_user_sign_in() -> bool:
+    """GOOGLE_PER_USER_SIGN_IN=1: each app session signs in with its own Google account.
+
+    The app then never falls back to a shared token, service account, or ADC.
+    """
+    return os.environ.get("GOOGLE_PER_USER_SIGN_IN") == "1"
+
+
+@contextmanager
+def use_credentials(creds):
+    """Make Drive/Slides calls in this context (and tasks started from it) use `creds`."""
+    token = _user_credentials.set(creds)
+    try:
+        yield
+    finally:
+        _user_credentials.reset(token)
+
+
+def _active_credentials():
+    creds = _user_credentials.get()
+    if creds is not None:
+        return creds
+    if per_user_sign_in():
+        raise GoogleSignInRequired("Not signed in to Google. Use 'Sign in with Google' in the sidebar first.")
+    return _credentials()
 
 
 @lru_cache(maxsize=1)
@@ -219,12 +261,12 @@ def _credentials():
 
 @lru_cache(maxsize=1)
 def _drive():
-    return build("drive", "v3", credentials=_credentials(), cache_discovery=False)
+    return build("drive", "v3", credentials=_active_credentials(), cache_discovery=False)
 
 
 @lru_cache(maxsize=1)
 def _slides():
-    return build("slides", "v1", credentials=_credentials(), cache_discovery=False)
+    return build("slides", "v1", credentials=_active_credentials(), cache_discovery=False)
 
 
 def _q(value: str) -> str:

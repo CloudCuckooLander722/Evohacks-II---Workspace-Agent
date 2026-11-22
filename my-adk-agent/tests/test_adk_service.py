@@ -255,3 +255,92 @@ def test_ui_new_conversation_resets(app, fake_gemini, fake_drive):
     assert not app.exception
     assert chat_texts(app) == []
     assert app.session_state.session_id != old_session
+
+
+def test_service_runs_each_request_with_its_users_credentials(service, fake_gemini, fake_drive, monkeypatch):
+    """Public mode: concurrent users' tool calls must each see only their own Google credentials."""
+    import tools.workspace_tools as t
+    import workspace_agent.workspace_agent as wa
+
+    seen = []
+
+    def find(name):
+        seen.append((name, t._active_credentials()))
+        return {"id": None}
+
+    monkeypatch.setattr(wa, "find_drive_folder", find)
+    monkeypatch.setattr(wa, "create_drive_folder", lambda name: {"id": f"f-{name}", "name": name})
+    monkeypatch.setenv("GOOGLE_PER_USER_SIGN_IN", "1")
+    set_router(fake_gemini, "FOLDER_CREATION")
+
+    users = {f"user{i}": object() for i in range(6)}
+    errors = []
+
+    def worker(user, creds):
+        try:
+            fake_gemini["folder_creation_agent"] = {"folder_name": "AP Chem"}
+            service.send(user, service.new_session(user), "make a folder", credentials=creds)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+    threads = [threading.Thread(target=worker, args=item) for item in users.items()]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors
+    assert len(seen) == len(users)
+    assert {id(c) for _, c in seen} == {id(c) for c in users.values()}   # each user's own creds, no mixing
+
+
+def test_per_user_mode_never_falls_back_to_shared_credentials(monkeypatch):
+    import tools.workspace_tools as t
+    monkeypatch.setenv("GOOGLE_PER_USER_SIGN_IN", "1")
+    monkeypatch.setattr(t, "_credentials", lambda: pytest.fail("shared credentials used in per-user mode"))
+    with pytest.raises(t.GoogleSignInRequired):
+        t._active_credentials()
+    creds = object()
+    with t.use_credentials(creds):
+        assert t._active_credentials() is creds
+    with pytest.raises(t.GoogleSignInRequired):
+        t._active_credentials()
+
+
+def test_local_mode_still_uses_shared_credentials(monkeypatch):
+    import tools.workspace_tools as t
+    monkeypatch.delenv("GOOGLE_PER_USER_SIGN_IN", raising=False)
+    shared = object()
+    monkeypatch.setattr(t, "_credentials", lambda: shared)
+    assert t._active_credentials() is shared
+
+
+def test_ui_per_user_mode_requires_sign_in_and_sends_own_credentials(monkeypatch, fake_gemini, fake_drive):
+    import streamlit as st
+    from streamlit.testing.v1 import AppTest
+
+    import adk_service.service as svc
+    import tools.workspace_tools as t
+
+    monkeypatch.setenv("WORKSPACE_AGENT_LOAD_DOTENV", "0")
+    monkeypatch.setenv("GOOGLE_PER_USER_SIGN_IN", "1")
+    monkeypatch.setattr(t, "google_sign_in_url", lambda: "https://accounts.google.com/o/oauth2/auth?x")
+    sent = []
+    real_send = svc.WorkspaceService.send
+    monkeypatch.setattr(svc.WorkspaceService, "send",
+                        lambda self, *a, **kw: sent.append(kw.get("credentials")) or real_send(self, *a, **kw))
+    st.cache_resource.clear()
+    at = AppTest.from_file(str(APP_FILE), default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert at.chat_input[0].disabled                      # signed out: can't use the agent
+    assert any(b.label == "Sign in with Google" for b in at.get("link_button"))
+
+    creds = object()
+    at.session_state["google_credentials"] = creds
+    at.run()
+    assert not at.chat_input[0].disabled
+    set_router(fake_gemini, "UNKNOWN")
+    at.chat_input[0].set_value("hello").run()
+    assert sent == [creds]
+
+    button(at, "Sign out").click().run()
+    assert at.chat_input[0].disabled

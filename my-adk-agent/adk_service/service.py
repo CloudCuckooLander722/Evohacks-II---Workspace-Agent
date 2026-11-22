@@ -27,6 +27,7 @@ from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import BaseSessionService, InMemorySessionService  # noqa: E402
 from google.genai import types  # noqa: E402
 
+from tools.workspace_tools import use_credentials  # noqa: E402
 from workspace_agent import root_agent  # noqa: E402
 
 APP_NAME = "workspace_agent"
@@ -113,24 +114,32 @@ class WorkspaceService:
         session = await self.runner.session_service.create_session(app_name=self.app_name, user_id=user_id)
         return session.id
 
-    async def _arun(self, user_id: str, session_id: str, message: types.Content) -> AgentReply:
-        events = [e async for e in self.runner.run_async(user_id=user_id, session_id=session_id, new_message=message)]
+    async def _arun(self, user_id: str, session_id: str, message: types.Content,
+                    credentials: Any = None) -> AgentReply:
+        if credentials is None:
+            events = [e async for e in self.runner.run_async(user_id=user_id, session_id=session_id, new_message=message)]
+        else:
+            # The context var is set inside this task, so every task the run starts inherits it
+            # and concurrent users' runs each see only their own credentials.
+            with use_credentials(credentials):
+                events = [e async for e in self.runner.run_async(user_id=user_id, session_id=session_id, new_message=message)]
         return collect_reply(events, self.root_name)
 
     async def asend(self, user_id: str, session_id: str, text: str,
-                    attachments: Sequence[Attachment] = ()) -> AgentReply:
+                    attachments: Sequence[Attachment] = (), credentials: Any = None) -> AgentReply:
         parts = [types.Part(text=text)] + [
             types.Part(inline_data=types.Blob(data=a.data, mime_type=a.mime_type, display_name=a.name))
             for a in attachments
         ]
-        return await self._arun(user_id, session_id, types.Content(role="user", parts=parts))
+        return await self._arun(user_id, session_id, types.Content(role="user", parts=parts), credentials)
 
     async def arespond(self, user_id: str, session_id: str, pending: PendingConfirmation,
-                       approved: bool, feedback: Optional[str] = None) -> AgentReply:
+                       approved: bool, feedback: Optional[str] = None, credentials: Any = None) -> AgentReply:
         response = types.FunctionResponse(
             id=pending.call_id, name=pending.name, response={"approved": approved, "feedback": feedback or None}
         )
-        return await self._arun(user_id, session_id, types.Content(role="user", parts=[types.Part(function_response=response)]))
+        return await self._arun(user_id, session_id, types.Content(role="user", parts=[types.Part(function_response=response)]),
+                                credentials)
 
     # -- sync API (runs on the service's own event loop) ----------------------
 
@@ -141,12 +150,12 @@ class WorkspaceService:
         return self._call(self.anew_session(user_id))
 
     def send(self, user_id: str, session_id: str, text: str,
-             attachments: Sequence[Attachment] = ()) -> AgentReply:
-        return self._call(self.asend(user_id, session_id, text, attachments))
+             attachments: Sequence[Attachment] = (), credentials: Any = None) -> AgentReply:
+        return self._call(self.asend(user_id, session_id, text, attachments, credentials))
 
     def respond(self, user_id: str, session_id: str, pending: PendingConfirmation,
-                approved: bool, feedback: Optional[str] = None) -> AgentReply:
-        return self._call(self.arespond(user_id, session_id, pending, approved, feedback))
+                approved: bool, feedback: Optional[str] = None, credentials: Any = None) -> AgentReply:
+        return self._call(self.arespond(user_id, session_id, pending, approved, feedback, credentials))
 
     def close(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
