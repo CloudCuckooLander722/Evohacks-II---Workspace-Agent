@@ -8,10 +8,14 @@
 #   REGION=us-central1              Cloud Run region
 #   SERVICE=workspace-agent         Cloud Run service name
 #   DRIVE_CREDENTIALS_FILE=token.json
-#       A Google credentials JSON for Drive (authorized-user token or service-account key).
+#       A Google credentials JSON for Drive: an authorized-user token, a service-account key,
+#       or a web OAuth client (users then sign in from the app's sidebar).
 #       Stored in Secret Manager and mounted at /secrets/google/credentials.json.
 #       If omitted, the app uses the Cloud Run service account, which only sees Drive
 #       folders that are shared with it.
+#   OAUTH_REDIRECT_URI=https://...   Web OAuth client only: the URL people open the app at,
+#       which must also be an authorized redirect URI on the client in Google Cloud Console.
+#       With a private service that is the `gcloud run services proxy` URL, not the run.app URL.
 #   ALLOW_PUBLIC=1                  Make the URL public. Default: callers need IAM
 #                                   (roles/run.invoker), because anyone who can open the
 #                                   app can create, move and trash files in the linked Drive.
@@ -57,7 +61,11 @@ ENV_VARS="WORKSPACE_AGENT_LOAD_DOTENV=0"
 if [[ -n "${DRIVE_CREDENTIALS_FILE:-}" ]]; then
   upsert_secret "${SERVICE}-drive-credentials" "$DRIVE_CREDENTIALS_FILE"
   SECRETS="${SECRETS},/secrets/google/credentials.json=${SERVICE}-drive-credentials:latest"
-  ENV_VARS="${ENV_VARS},GOOGLE_CREDENTIALS_PATH=/secrets/google/credentials.json"
+  # Secret mounts are read-only; a signed-in user's token goes to the instance's /tmp.
+  ENV_VARS="${ENV_VARS},GOOGLE_CREDENTIALS_PATH=/secrets/google/credentials.json,GOOGLE_OAUTH_TOKEN_FILE=/tmp/token.json"
+fi
+if [[ -n "${OAUTH_REDIRECT_URI:-}" ]]; then
+  ENV_VARS="${ENV_VARS},GOOGLE_OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI}"
 fi
 
 AUTH_FLAG="--no-allow-unauthenticated"
